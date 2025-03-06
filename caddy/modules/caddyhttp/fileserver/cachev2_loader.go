@@ -1,7 +1,6 @@
 package fileserver
 
 import (
-	"errors"
 	"io"
 	"os"
 
@@ -17,7 +16,8 @@ func getServiceWorkerRelativePath() string {
 }
 
 func loadCacheV2ServiceWorker(root string) error {
-	return copyFile("modules/caddyhttp/fileserver/sw.js", root+"sw.js")
+	dst := caddyhttp.SanitizedPathJoin(root, "sw.js")
+	return copyFile("modules/caddyhttp/fileserver/sw.js", dst)
 }
 
 func copyFile(src, dst string) error {
@@ -25,27 +25,14 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	defer source.Close()
 
 	destination, err := os.Create(dst)
 	if err != nil {
 		return err
 	}
+	defer destination.Close()
 
-	buf := make([]byte, 1024)
-
-	for {
-		n, err := source.Read(buf)
-		if err != nil && errors.Is(err, io.EOF) {
-			return nil
-		}
-		if n == 0 {
-			break
-		}
-
-		if _, err := destination.Write(buf[:n]); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	_, err = io.Copy(destination, source)
+	return err
 }
