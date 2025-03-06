@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"slices"
 	"strings"
@@ -27,51 +28,52 @@ func findTags(root *html.Node, tags []atom.Atom) []*html.Node {
 	return foundTags
 }
 
-func fileLocatedInThisHost(url string) bool {
-	return strings.Contains(url, "localhost") || !strings.Contains(strings.ToLower(url), "http")
+func isLocalfile(uri string) bool {
+	s := strings.ToLower(uri)
+	return strings.Contains(s, "localhost") || !strings.Contains(s, "http")
 }
 
-func getNormalizedFileName(fileName string) string {
-	qMarkIndex := strings.Index(fileName, "?")
-	if qMarkIndex == -1 {
-		return fileName
+func normalizeFilename(s string) string {
+	idx := strings.Index(s, "?")
+	if idx == -1 {
+		return s
 	}
 
-	return fileName[:qMarkIndex]
+	return s[:idx]
 }
 
-func getEtagJsonAndRegisterServiceWorker(fileSystem fs.FS, rootDir, htmlString string) (string, string, error) {
-	etagMap := make(map[string]string)
-	root, err := html.Parse(strings.NewReader(htmlString))
+func getEtagJsonAndRegisterServiceWorker(fsys fs.FS, rootDir string, h io.Reader) (string, string, error) {
+	m := make(map[string]string)
+	root, err := html.Parse(h)
 	if err != nil {
 		return "", "", err
 	}
 
-	imageTags := findTags(root, []atom.Atom{atom.Img, atom.Link, atom.Script})
-	for _, imgNode := range imageTags {
+	tags := findTags(root, []atom.Atom{atom.Img, atom.Link, atom.Script})
+	for _, node := range tags {
 		var src *html.Attribute
-		for _, attr := range imgNode.Attr {
-			attrCopy := attr
+		for _, attr := range node.Attr {
+			a := attr
 			if attr.Key == "src" {
-				src = &attrCopy
+				src = &a
 				break
 			} else if attr.Key == "href" {
-				src = &attrCopy
+				src = &a
 				break
 			}
 		}
 
-		if src == nil || !fileLocatedInThisHost(src.Val) {
+		if src == nil || !isLocalfile(src.Val) {
 			continue
 		}
 
-		fileName := strings.TrimSuffix(caddyhttp.SanitizedPathJoin(rootDir, getNormalizedFileName(src.Val)), "/")
-		stat, err := fs.Stat(fileSystem, fileName)
+		fileName := strings.TrimSuffix(caddyhttp.SanitizedPathJoin(rootDir, normalizeFilename(src.Val)), "/")
+		stat, err := fs.Stat(fsys, fileName)
 		if err != nil {
 			continue
 		}
 
-		etagMap[src.Val] = calculateEtag(stat)
+		m[src.Val] = calculateEtag(stat)
 	}
 
 	jsCode := `
@@ -99,18 +101,18 @@ if ('serviceWorker' in navigator) {
 		body.AppendChild(script)
 	}
 
-	buffer := new(bytes.Buffer)
-	w := bufio.NewWriter(buffer)
-	err = html.Render(w, root)
+	buf := new(bytes.Buffer)
+	w := bufio.NewWriter(buf)
+	_ = html.Render(w, root)
 	err = w.Flush()
 	if err != nil {
 		return "", "", err
 	}
 
-	etagJson, err := json.Marshal(etagMap)
+	etagJson, err := json.Marshal(m)
 	if err != nil {
 		return "", "", err
 	}
 
-	return buffer.String(), string(etagJson), nil
+	return buf.String(), string(etagJson), nil
 }

@@ -284,7 +284,9 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 		if filename == getServiceWorkerFullPath(root) { // TODO: refactor
 			filename = getServiceWorkerRelativePath()
 			info, err = fs.Stat(fsrv.fileSystem, filename)
-		} else {
+		}
+		// if err persists, we'll handle it below
+		if err != nil {
 			err = fsrv.mapDirOpenError(err, filename)
 			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, fs.ErrInvalid) {
 				return fsrv.notFound(w, r, next)
@@ -511,7 +513,7 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 			newContent, etags, err := getEtagJsonAndRegisterServiceWorker(
 				fsrv.fileSystem,
 				root+r.RequestURI,
-				b.String(),
+				b,
 			)
 			if err != nil {
 				fsrv.logger.Warn("failed to inject last-modified attr.", zap.Error(err))
