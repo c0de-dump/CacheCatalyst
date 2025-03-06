@@ -1,64 +1,59 @@
-import os, datetime
-import sys, subprocess, jinja2
+import os
+import subprocess, jinja2
+import argparse
 
+def compile_template(src: str, output: str, data={}):
+    loader = jinja2.FileSystemLoader(searchpath=".")
+    env = jinja2.Environment(loader=loader)
+    template = env.get_template(src)
 
-def download_dataset(count, to):
-    FILE_PER_CURL = 50
-    i = 0
-    while count > 0:
-        request_for = min(count, FILE_PER_CURL)
+    outputText = template.render(data)
+    with open(output, "w") as f:
+        f.write(outputText)
+
+def download_dataset(to, count=50):
+    for i in range(count):
         subprocess.run(
             [
                 "curl",
-                f"https://unsample.net/archive?count={request_for}&width=1920&height=1080",
+                "-sL",
+                f"https://picsum.photos/1920/1080/?random={i}",
                 "--output",
-                f"{to}/a{i}.zip",
+                f"{to}/{i}.jpg",
             ])
-        subprocess.run(
-            ["unzip", "-d", f"{to}/a{i}", f"{to}/a{i}.zip"],
-        )
-        count -= FILE_PER_CURL
-        i += 1
-
 
 def get_paths(root_dir):
     output = []
     files = os.listdir(root_dir)
     for file in files:
-        if os.path.isfile(root_dir + "/" + file):
-            output += [f"{root_dir}/{file}"]
+        fp = os.path.join(root_dir, file)
+        if os.path.isfile(fp):
+            output.append(fp)
         else:
-            output += get_paths(root_dir + "/" + file)
+            output.extend(get_paths(fp))
     return output
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-media-dir", type=str)
+    parser.add_argument("-init-dataset", type=int, default=0)
+    parser.add_argument("-prefix", type=str, default="")
+    args = parser.parse_args()
 
-args = sys.argv[1:]
-media_dir = args[args.index("-media-dir") + 1]
-download_data = "-init-dataset" in args
+    media_dir = os.path.abspath(args.media_dir)
+    if not os.path.exists(media_dir):
+        print("Media directory does not exist. Creating...")
+        os.mkdir(media_dir)
 
-if download_data:
-    download_dataset(int(args[args.index("-init-dataset") + 1]), media_dir)
-
-templateLoader = jinja2.FileSystemLoader(searchpath=".")
-templateEnv = jinja2.Environment(loader=templateLoader)
-
-TEMPLATE_FILE = "template.html"
-template = templateEnv.get_template(TEMPLATE_FILE)
-
-pictures = get_paths(media_dir)
-if "-prefix" in args:
-    prefix = args[args.index("-prefix") + 1]
-    pictures = [
-        {"key": picture.replace(media_dir + "/", prefix)}
-        for picture in pictures
-    ]
-outputText = template.render({"pictures": pictures})
-
-with open("index.html", "w") as f:
-    f.write(outputText)
-
-subprocess.run([
-    "mv",
-    "index.html",
-    media_dir
-])
+    if args.init_dataset > 0:
+        download_dataset(media_dir, count=args.init_dataset)
+    
+    pictures = get_paths(media_dir)
+    if args.prefix:
+        pictures = [
+            {"key": picture.replace(media_dir + "/", args.prefix)}
+            for picture in pictures
+        ]
+    
+    dst = os.path.join(media_dir, "index.html")
+    compile_template("template.html", dst, data={'pictures': pictures})
