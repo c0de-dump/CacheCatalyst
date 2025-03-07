@@ -1,11 +1,13 @@
-FROM golang:1.22-bullseye
-
-WORKDIR /app
+FROM golang:1.22-alpine AS builder
 
 COPY ./caddy .
-
 RUN go mod download
+RUN go build -o /caddy ./cmd/caddy
 
-RUN go build -o newcaddy ./cmd/caddy
+FROM alpine:latest
 
-ENTRYPOINT [ "./newcaddy", "run", "--config", "/tmp/storage/Caddyfile" ]
+WORKDIR /app
+COPY --from=builder /caddy newcaddy
+
+# ENTRYPOINT [ "./newcaddy", "run", "--config", "/tmp/storage/Caddyfile" ]
+ENTRYPOINT [ "./newcaddy", "run" ]
