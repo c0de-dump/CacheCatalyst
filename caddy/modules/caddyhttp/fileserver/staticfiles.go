@@ -24,6 +24,7 @@ import (
 	weakrand "math/rand"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -168,6 +169,8 @@ type FileServer struct {
 	// that both client and server support is used
 	PrecompressedOrder []string `json:"precompressed_order,omitempty"`
 	precompressors     map[string]encode.Precompressed
+	// The ETag store for caching ETags.
+	store *EtagStore
 
 	logger *zap.Logger
 }
@@ -182,6 +185,7 @@ func (FileServer) CaddyModule() caddy.ModuleInfo {
 
 // Provision sets up the static files responder.
 func (fsrv *FileServer) Provision(ctx caddy.Context) error {
+	fsrv.store = NewEtagStore()
 	fsrv.logger = ctx.Logger()
 
 	// establish which file system (possibly a virtual one) we'll be using
@@ -250,8 +254,114 @@ func (fsrv *FileServer) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+func (fsrv *FileServer) proxyRequest(w http.ResponseWriter, r *http.Request) error {
+	targetURLStr := r.URL.Query().Get("url")
+	if targetURLStr == "" {
+		return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("missing 'url' query parameter"))
+	}
+
+	// Basic URL validation
+	targetURL, err := url.Parse(targetURLStr)
+	if err != nil || (targetURL.Scheme != "http" && targetURL.Scheme != "https") {
+		fsrv.logger.Warn("Invalid proxy target URL", zap.String("url", targetURLStr), zap.Error(err))
+		return caddyhttp.Error(http.StatusBadRequest, fmt.Errorf("invalid 'url' query parameter: %w", err))
+	}
+
+	fsrv.logger.Debug("Proxying request for service worker", zap.String("target_url", targetURLStr))
+
+	// Create the request to the third-party server
+	proxyReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, targetURLStr, nil)
+	if err != nil {
+		fsrv.logger.Error("Failed to create proxy request", zap.String("target_url", targetURLStr), zap.Error(err))
+		// Return internal server error as this is a server-side issue
+		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+
+	// Copy essential headers (consider adding more if needed, like Accept-Language)
+	if userAgent := r.UserAgent(); userAgent != "" {
+		proxyReq.Header.Set("User-Agent", userAgent)
+	}
+	if accept := r.Header.Get("Accept"); accept != "" {
+		proxyReq.Header.Set("Accept", accept)
+	}
+	// Avoid sending cookies or authorization from the original request to the third party
+	proxyReq.Header.Del("Cookie")
+	proxyReq.Header.Del("Authorization")
+
+	// Fallback: Always use default transport for proxy requests.
+	// Caddy-specific settings (timeouts, TLS) might not apply.
+	fsrv.logger.Warn("Creating new HTTP client with default transport for proxy request. Caddy-specific settings might not apply.")
+	client := &http.Client{Transport: http.DefaultTransport}
+
+	resp, err := client.Do(proxyReq)
+	if err != nil {
+		fsrv.logger.Error("Failed to fetch resource via proxy", zap.String("target_url", targetURLStr), zap.Error(err))
+		// Determine appropriate error code based on the error (e.g., context deadline exceeded -> 504)
+		// For simplicity, return 502 Bad Gateway for now
+		return caddyhttp.Error(http.StatusBadGateway, fmt.Errorf("proxy request failed: %w", err))
+	}
+	defer resp.Body.Close()
+
+	fsrv.logger.Debug("Received response from proxy target",
+		zap.String("target_url", targetURLStr),
+		zap.Int("status_code", resp.StatusCode),
+		zap.String("content_type", resp.Header.Get("Content-Type")))
+
+	// Store the ETag using the *original* third-party URL as the key
+	etag := resp.Header.Get("ETag")
+	if etag != "" {
+		fsrv.store.Set(targetURLStr, etag)
+	}
+
+	// Copy headers from the proxy response to our response writer.
+	// Filter hop-by-hop headers and potentially sensitive headers.
+	hdr := w.Header()
+	for k, vv := range resp.Header {
+		// Filter common hop-by-hop headers (might need a more extensive list)
+		if strings.EqualFold(k, "connection") || strings.EqualFold(k, "proxy-authenticate") ||
+			strings.EqualFold(k, "proxy-authorization") || strings.EqualFold(k, "transfer-encoding") ||
+			strings.EqualFold(k, "keep-alive") || strings.EqualFold(k, "trailer") || strings.EqualFold(k, "upgrade") {
+			continue
+		}
+		// Filter potentially sensitive headers or headers managed by Caddy
+		if strings.EqualFold(k, "set-cookie") || strings.EqualFold(k, "strict-transport-security") || strings.EqualFold(k, "server") {
+			continue
+		}
+
+		// Set the header (using Set instead of Add to avoid duplicates if key differs only by case)
+		// Important: Set overwrites, Add appends. Choose based on header semantics.
+		// For most headers, Set is appropriate. For things like Vary, Add might be needed.
+		hdr[http.CanonicalHeaderKey(k)] = vv // Use CanonicalHeaderKey for proper formatting
+	}
+	// Ensure Content-Type is set
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		hdr.Set("Content-Type", contentType)
+	}
+
+	// Write the status code from the proxy response
+	w.WriteHeader(resp.StatusCode)
+
+	// Copy the response body from the proxy response
+	copiedBytes, err := io.Copy(w, resp.Body)
+	if err != nil {
+		return caddyhttp.Error(http.StatusInternalServerError, fmt.Errorf("error copying response body: %w", err))
+	}
+
+	fsrv.logger.Info("Successfully proxied request",
+		zap.String("target_url", targetURLStr),
+		zap.Int("status_code", resp.StatusCode),
+		zap.Int64("bytes_copied", copiedBytes))
+
+	return nil
+}
+
 func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+
+	proxyPrefix := "/proxy-resource"
+	if strings.HasPrefix(r.URL.Path, proxyPrefix) {
+		return fsrv.proxyRequest(w, r)
+	}
 
 	if runtime.GOOS == "windows" {
 		// reject paths with Alternate Data Streams (ADS)
@@ -519,7 +629,14 @@ func (fsrv *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 				fsrv.logger.Warn("failed to inject last-modified attr.", zap.Error(err))
 			} else {
 				content = bytes.NewReader([]byte(newContent))
-				w.Header().Set("X-Etag-Config", etags)
+
+				mergedEtags, err := fsrv.store.MergeJSON(etags)
+				if err != nil {
+					fsrv.logger.Warn("failed to merge etags", zap.Error(err))
+					w.Header().Set("X-Etag-Config", etags)
+				} else {
+					w.Header().Set("X-Etag-Config", string(mergedEtags))
+				}
 			}
 		}
 	}
